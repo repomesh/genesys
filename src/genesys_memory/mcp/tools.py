@@ -307,65 +307,83 @@ class MCPToolHandler:
         cap = max_results if max_results is not None else k
         memories = memories[:cap]
 
-        # Enrich top results with causal chains (only for the capped set)
+        # Enrich top results with causal chains (parallel fetch instead of serial)
         org_ids_for_chain = current_org_ids.get([])
-        for mem in memories:
-            mem_id = mem.get("id")
-            if not mem_id:
-                continue
+        mem_ids_for_chain = [m["id"] for m in memories if m.get("id")]
+        if mem_ids_for_chain:
             try:
-                upstream = await self.graph.get_causal_chain(mem_id, "upstream", org_ids=org_ids_for_chain)
-                downstream = await self.graph.get_causal_chain(mem_id, "downstream", org_ids=org_ids_for_chain)
-                causal_basis = []
-                causal_chain = []
-                seen_causal = set()
-                for n in upstream[:5]:
-                    nid_str = str(n.id)
-                    if nid_str not in seen_causal:
-                        causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "upstream"})
-                        seen_causal.add(nid_str)
-                for n in downstream[:5]:
-                    nid_str = str(n.id)
-                    if nid_str not in seen_causal:
-                        causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "downstream"})
-                        seen_causal.add(nid_str)
-                if upstream:
-                    for n in reversed(upstream[:5]):
-                        causal_chain.append({"id": str(n.id), "summary": n.content_summary})
-                    origin = node_by_id.get(mem_id)
-                    if origin:
-                        causal_chain.append({"id": mem_id, "summary": origin.content_summary})
-                mem["causal_basis"] = causal_basis
-                if causal_chain:
-                    mem["causal_chain"] = causal_chain
+                chain_coros = []
+                for mid in mem_ids_for_chain:
+                    chain_coros.append(self.graph.get_causal_chain(mid, "upstream", org_ids=org_ids_for_chain))
+                    chain_coros.append(self.graph.get_causal_chain(mid, "downstream", org_ids=org_ids_for_chain))
+                chain_results = await asyncio.gather(*chain_coros, return_exceptions=True)
+                for i, mid in enumerate(mem_ids_for_chain):
+                    upstream = chain_results[i * 2]
+                    downstream = chain_results[i * 2 + 1]
+                    if isinstance(upstream, BaseException):
+                        upstream = []
+                    if isinstance(downstream, BaseException):
+                        downstream = []
+                    mem = next(m for m in memories if m.get("id") == mid)
+                    causal_basis = []
+                    causal_chain = []
+                    seen_causal: set[str] = set()
+                    for n in upstream[:5]:
+                        nid_str = str(n.id)
+                        if nid_str not in seen_causal:
+                            causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "upstream"})
+                            seen_causal.add(nid_str)
+                    for n in downstream[:5]:
+                        nid_str = str(n.id)
+                        if nid_str not in seen_causal:
+                            causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "downstream"})
+                            seen_causal.add(nid_str)
+                    if upstream:
+                        for n in reversed(upstream[:5]):
+                            causal_chain.append({"id": str(n.id), "summary": n.content_summary})
+                        origin = node_by_id.get(mid)
+                        if origin:
+                            causal_chain.append({"id": mid, "summary": origin.content_summary})
+                    mem["causal_basis"] = causal_basis
+                    if causal_chain:
+                        mem["causal_chain"] = causal_chain
             except Exception:
-                logger.warning("Causal chain fetch failed for node %s", mem_id, exc_info=True)
+                logger.warning("Causal chain batch fetch failed", exc_info=True)
 
         # Update reactivation state + validate co-retrieval edges (skip in read_only mode)
         if not read_only:
             with self._defer_saves():
                 now = datetime.now(timezone.utc)
+                reactivation_coros = []
+                reactivation_mems = []
                 for mem in memories:
                     mem_id = mem.get("id")
                     if not mem_id:
                         continue
-                    try:
-                        recalled = node_by_id.get(mem_id)
-                        if recalled:
-                            stability_delta = 0.1 / recalled.stability
-                            await self.graph.atomic_reactivation_update(mem_id, now, stability_delta)
-                            mem["reactivation_count"] = recalled.reactivation_count + 1
-                    except Exception:
-                        logger.warning("Reactivation update failed for node %s", mem_id, exc_info=True)
+                    recalled = node_by_id.get(mem_id)
+                    if recalled:
+                        stability_delta = 0.1 / recalled.stability
+                        reactivation_coros.append(
+                            self.graph.atomic_reactivation_update(mem_id, now, stability_delta)
+                        )
+                        reactivation_mems.append((mem, recalled.reactivation_count + 1))
+                if reactivation_coros:
+                    results = await asyncio.gather(*reactivation_coros, return_exceptions=True)
+                    for j, (mem, new_count) in enumerate(reactivation_mems):
+                        if not isinstance(results[j], BaseException):
+                            mem["reactivation_count"] = new_count
 
                 if len(memories) > 1:
                     recalled_ids = {m["id"] for m in memories if m.get("id")}
                     try:
                         recall_edges = await self.graph.get_all_edges(list(recalled_ids))
-                        for edge in recall_edges:
-                            src, tgt = str(edge.source_id), str(edge.target_id)
-                            if src in recalled_ids and tgt in recalled_ids:
-                                await self.graph.validate_edge(str(edge.id))
+                        validate_coros = [
+                            self.graph.validate_edge(str(edge.id))
+                            for edge in recall_edges
+                            if str(edge.source_id) in recalled_ids and str(edge.target_id) in recalled_ids
+                        ]
+                        if validate_coros:
+                            await asyncio.gather(*validate_coros, return_exceptions=True)
                     except Exception:
                         logger.warning("Co-retrieval edge validation failed", exc_info=True)
 
