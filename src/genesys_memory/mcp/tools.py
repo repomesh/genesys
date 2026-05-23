@@ -220,6 +220,9 @@ class MCPToolHandler:
         kw_results_per_term: list[list[MemoryNode]] = embed_and_kw[1:]
 
         # 1. Vector search (needs embedding)
+        from genesys_memory.engine import config as engine_config
+        min_sim = engine_config.RECALL_MIN_SIMILARITY
+
         vector_results = await self.graph.vector_search(embedding, k=k, org_ids=org_ids)
 
         # 2. Collect keyword hits
@@ -237,6 +240,8 @@ class MCPToolHandler:
 
         vector_ids: set[str] = set()
         for node, score in vector_results:
+            if score < min_sim:
+                continue
             nid = str(node.id)
             vector_ids.add(nid)
             merged[nid] = {"node": node, "vec_score": score, "in_both": nid in kw_node_ids}
@@ -248,6 +253,8 @@ class MCPToolHandler:
                     vec_score = cosine_similarity(node.embedding, embedding)
                 else:
                     vec_score = 0.0
+                if vec_score < min_sim:
+                    continue
                 merged[nid] = {"node": node, "vec_score": vec_score, "in_both": False}
 
         # 4. Format results without causal chains first (defer expensive graph queries)
@@ -264,16 +271,22 @@ class MCPToolHandler:
             if self.event_bus and nid in vector_ids:
                 await self.event_bus.publish("memory.accessed", {"node_id": nid})
 
-        # Inject core memories not already in results
+        # Inject core memories not already in results (only if relevant to query)
+        core_min_sim = engine_config.CORE_INJECT_MIN_SIMILARITY
         core_nodes = await self.graph.get_nodes_by_status(MemoryStatus.CORE, limit=50)
         seen_ids = set(merged.keys())
         for cnode in core_nodes:
             cid = str(cnode.id)
             if cid not in seen_ids:
+                core_sim = 0.0
+                if cnode.embedding and embedding:
+                    core_sim = cosine_similarity(cnode.embedding, embedding)
+                if core_sim < core_min_sim:
+                    continue
                 node_by_id[cid] = cnode
-                mem = self._format_memory_light(cnode, 0.0)
+                mem = self._format_memory_light(cnode, core_sim)
                 mem["is_core"] = True
-                mem["_rank_score"] = 0.0
+                mem["_rank_score"] = core_sim
                 memories.append(mem)
 
         # Batch superseded check: one get_all_edges call instead of N get_edges calls

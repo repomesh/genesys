@@ -60,6 +60,12 @@ SCHEMA_NEIGHBOR_CAP = _int("GENESYS_SCHEMA_NEIGHBOR_CAP", "10")
 STABILITY_CAP = _float("GENESYS_STABILITY_CAP", "3.0")
 
 # ---------------------------------------------------------------------------
+# Recall Relevance Filtering (tools.py — memory_recall)
+# ---------------------------------------------------------------------------
+RECALL_MIN_SIMILARITY = _float("GENESYS_RECALL_MIN_SIMILARITY", "0.5")
+CORE_INJECT_MIN_SIMILARITY = _float("GENESYS_CORE_INJECT_MIN_SIMILARITY", "0.3")
+
+# ---------------------------------------------------------------------------
 # Edge Staleness
 # ---------------------------------------------------------------------------
 EDGE_STALE_DAYS = _int("GENESYS_EDGE_STALE_DAYS", "30")
